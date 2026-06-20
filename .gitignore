@@ -1,0 +1,28 @@
+# ---- Build output (everything the .NET build/publish generates) ----
+bin/
+obj/
+publish/
+[Dd]ebug/
+[Rr]elease/
+*.dll
+*.exe
+*.pdb
+*.deps.json
+*.runtimeconfig.json
+*.nupkg
+
+# ---- MPLAB X / IPE run artifacts (logs, locks, boost state) ----
+MPLABXLog.xml
+MPLABXLog.xml.lck
+*.lck
+.mchp_ipe/
+*.ini
+*.lock
+
+# ---- IDE / OS noise ----
+.vs/
+.vscode/
+.idea/
+*.user
+.DS_Store
+Thumbs.db

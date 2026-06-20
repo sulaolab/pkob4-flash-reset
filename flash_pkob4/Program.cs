@@ -1,0 +1,391 @@
+// flash_pkob4 - native wrapper around MPLAB X mdb.bat programming, selecting a
+// board by PKOB4 serial number.
+//
+// This is ONLY a wrapper: it writes a temporary MDB script equivalent to:
+//   device <device>
+//   hwtool pkob4 -p <sn><serial>
+//   program "<hex>"
+//   quit
+// then executes mdb.bat with timeout, retry, output capture and success-marker
+// checking. It does not touch the PKOB4 USB protocol directly.
+//
+// Exit codes: 0 success, 1 invalid args, 2 MPLAB X/mdb/hex not found,
+//             3 programming failed, 4 timeout after retry, 5 unexpected exception.
+
+using System.Diagnostics;
+using System.Text;
+
+internal static class Program
+{
+    private const string DefaultDevice = "dsPIC33AK512MPS512";
+    private const string ToolType = "pkob4";
+
+    private static int Main(string[] args)
+    {
+        try
+        {
+            return Run(args);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("Unexpected error: " + ex.Message);
+            return 5;
+        }
+    }
+
+    private static int Run(string[] args)
+    {
+        string? serial = null;
+        string? hex = null;
+        string device = DefaultDevice;
+        int timeoutSec = 120;
+        int retry = 0;
+        bool verbose = false;
+        bool dryRun = false;
+
+        for (int i = 0; i < args.Length; i++)
+        {
+            string arg = args[i];
+            switch (arg)
+            {
+                case "--serial": serial = NextArg(args, ref i); break;
+                case "--hex": hex = NextArg(args, ref i); break;
+                case "--device": device = NextArg(args, ref i); break;
+                case "--timeout":
+                    if (!int.TryParse(NextArg(args, ref i), out timeoutSec) || timeoutSec <= 0)
+                    {
+                        return Invalid("--timeout must be a positive integer (seconds)");
+                    }
+                    break;
+                case "--retry":
+                    if (!int.TryParse(NextArg(args, ref i), out retry) || retry < 0)
+                    {
+                        return Invalid("--retry must be >= 0");
+                    }
+                    break;
+                case "--verbose": verbose = true; break;
+                case "--dry-run": dryRun = true; break;
+                case "-h":
+                case "--help":
+                    PrintUsage();
+                    return 0;
+                default:
+                    return Invalid("unknown argument: " + arg);
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(serial))
+        {
+            return Invalid("--serial <PKOB4 serial> is required");
+        }
+        if (string.IsNullOrWhiteSpace(hex))
+        {
+            return Invalid("--hex <path> is required");
+        }
+
+        string hexPath = Path.GetFullPath(hex);
+        if (!File.Exists(hexPath))
+        {
+            Console.Error.WriteLine("HEX file not found: " + hexPath);
+            return 2;
+        }
+
+        if (!TryDetectMdb(out string mplabRoot, out string mdbBat, out string detectErr))
+        {
+            Console.Error.WriteLine("MPLAB X mdb.bat not found.");
+            Console.Error.WriteLine("Reason: " + detectErr);
+            return 2;
+        }
+
+        string scriptPath = Path.Combine(Path.GetTempPath(), $"flash_pkob4_{Environment.ProcessId}_{Guid.NewGuid():N}.txt");
+        string[] scriptLines =
+        {
+            "device " + device,
+            $"hwtool {ToolType} -p <sn>{serial}",
+            $"program \"{hexPath}\"",
+            "quit",
+        };
+
+        if (verbose || dryRun)
+        {
+            Console.WriteLine("MPLAB X: " + mplabRoot);
+            Console.WriteLine("MDB:     " + mdbBat);
+            Console.WriteLine("Serial:  " + serial);
+            Console.WriteLine("Device:  " + device);
+            Console.WriteLine("HEX:     " + hexPath);
+            Console.WriteLine($"Timeout: {timeoutSec}s   Retry: {retry}");
+            Console.WriteLine("MDB script:");
+            foreach (string line in scriptLines)
+            {
+                Console.WriteLine("  " + line);
+            }
+        }
+
+        if (dryRun)
+        {
+            Console.WriteLine("Dry-run: not programming target.");
+            return 0;
+        }
+
+        int attempts = retry + 1;
+        bool lastTimedOut = false;
+
+        for (int attempt = 1; attempt <= attempts; attempt++)
+        {
+            try
+            {
+                File.WriteAllLines(scriptPath, scriptLines, Encoding.ASCII);
+                var result = RunMdb(mdbBat, scriptPath, timeoutSec, verbose);
+                lastTimedOut = result.TimedOut;
+
+                if (verbose)
+                {
+                    Console.WriteLine($"ExitCode: {result.ExitCode}{(result.TimedOut ? " (timeout)" : "")}");
+                }
+
+                if (result.Ok)
+                {
+                    Console.WriteLine(attempt > 1
+                        ? "PKOB4 flash succeeded on retry."
+                        : "PKOB4 flash succeeded.");
+                    Console.WriteLine("Serial: " + serial);
+                    Console.WriteLine("HEX: " + hexPath);
+                    return 0;
+                }
+
+                if (attempt < attempts)
+                {
+                    Console.WriteLine(result.TimedOut
+                        ? "PKOB4 flash timed out. Retrying..."
+                        : "PKOB4 flash failed. Retrying...");
+                }
+            }
+            finally
+            {
+                TryDelete(scriptPath);
+            }
+        }
+
+        Console.WriteLine("PKOB4 flash failed.");
+        Console.WriteLine("Serial: " + serial);
+        Console.WriteLine("HEX: " + hexPath);
+        Console.WriteLine("Reason: " + (lastTimedOut ? "timeout after retry" : "mdb reported failure"));
+        return lastTimedOut ? 4 : 3;
+    }
+
+    private static string NextArg(string[] args, ref int i)
+    {
+        if (i + 1 >= args.Length)
+        {
+            throw new ArgumentException($"missing value after {args[i]}");
+        }
+        return args[++i];
+    }
+
+    private static int Invalid(string message)
+    {
+        Console.Error.WriteLine("Invalid arguments: " + message);
+        Console.Error.WriteLine("Try: flash_pkob4 --serial <SERIAL> --hex <HEX> [--device D] [--timeout S] [--retry N] [--verbose] [--dry-run]");
+        return 1;
+    }
+
+    private static void PrintUsage()
+    {
+        Console.WriteLine("flash_pkob4 - flash one PKOB4-attached target by serial via MPLAB X mdb.");
+        Console.WriteLine();
+        Console.WriteLine("Usage: flash_pkob4 --serial <SERIAL> --hex <HEX> [options]");
+        Console.WriteLine("  --serial  <sn>    PKOB4 serial number (required), e.g. 020085204RYN000318");
+        Console.WriteLine("  --hex     <path>  HEX file to program (required)");
+        Console.WriteLine("  --device  <dev>   MDB device token (default dsPIC33AK512MPS512)");
+        Console.WriteLine("  --timeout <sec>   per-attempt timeout (default 120)");
+        Console.WriteLine("  --retry   <n>     retries after the first attempt (default 0)");
+        Console.WriteLine("  --verbose         print detected paths, script, output and exit code");
+        Console.WriteLine("  --dry-run         print what would run, do not program");
+    }
+
+    private static bool TryDetectMdb(out string mplabRoot, out string mdbBat, out string err)
+    {
+        mplabRoot = "";
+        mdbBat = "";
+        err = "";
+
+        var roots = new List<string>();
+        foreach (string programFiles in new[]
+        {
+            Environment.GetEnvironmentVariable("ProgramFiles") ?? @"C:\Program Files",
+            Environment.GetEnvironmentVariable("ProgramFiles(x86)") ?? @"C:\Program Files (x86)",
+        })
+        {
+            string baseDir = Path.Combine(programFiles, "Microchip", "MPLABX");
+            if (Directory.Exists(baseDir))
+            {
+                roots.Add(baseDir);
+            }
+        }
+
+        if (roots.Count == 0)
+        {
+            err = @"no C:\Program Files\Microchip\MPLABX directory";
+            return false;
+        }
+
+        var versions = new List<(Version Version, string Dir)>();
+        foreach (string baseDir in roots)
+        {
+            foreach (string dir in Directory.GetDirectories(baseDir, "v*"))
+            {
+                string name = Path.GetFileName(dir).TrimStart('v', 'V');
+                if (Version.TryParse(name, out Version? version))
+                {
+                    versions.Add((version, dir));
+                }
+            }
+        }
+
+        if (versions.Count == 0)
+        {
+            err = "no MPLABX vX.YY install folders found";
+            return false;
+        }
+
+        foreach ((_, string dir) in versions.OrderByDescending(version => version.Version))
+        {
+            string candidate = Path.Combine(dir, "mplab_platform", "bin", "mdb.bat");
+            if (!File.Exists(candidate))
+            {
+                continue;
+            }
+
+            mplabRoot = dir;
+            mdbBat = candidate;
+            return true;
+        }
+
+        err = "found MPLAB X but no install had mplab_platform\\bin\\mdb.bat";
+        return false;
+    }
+
+    private static void TryDelete(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+        catch
+        {
+            // Best effort cleanup only.
+        }
+    }
+
+    private readonly record struct MdbResult(bool Ok, int ExitCode, bool TimedOut, string Output);
+
+    private static MdbResult RunMdb(string mdbBat, string scriptPath, int timeoutSec, bool verbose)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = mdbBat,
+            Arguments = Quote(scriptPath),
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            RedirectStandardInput = true,
+        };
+
+        var output = new StringBuilder();
+        using var process = new Process { StartInfo = psi };
+
+        process.OutputDataReceived += (_, e) =>
+        {
+            if (e.Data == null)
+            {
+                return;
+            }
+            lock (output)
+            {
+                output.AppendLine(e.Data);
+            }
+            if (verbose)
+            {
+                Console.WriteLine("    " + e.Data);
+            }
+        };
+
+        process.ErrorDataReceived += (_, e) =>
+        {
+            if (e.Data == null)
+            {
+                return;
+            }
+            lock (output)
+            {
+                output.AppendLine(e.Data);
+            }
+            if (verbose)
+            {
+                Console.WriteLine("    " + e.Data);
+            }
+        };
+
+        process.Start();
+        process.BeginOutputReadLine();
+        process.BeginErrorReadLine();
+        try
+        {
+            process.StandardInput.Close();
+        }
+        catch
+        {
+            // Child receives stdin EOF.
+        }
+
+        if (!process.WaitForExit(timeoutSec * 1000))
+        {
+            try
+            {
+                process.Kill(entireProcessTree: true);
+            }
+            catch
+            {
+                // Already gone.
+            }
+            try
+            {
+                process.WaitForExit(3000);
+            }
+            catch
+            {
+                // Best effort.
+            }
+            return new MdbResult(false, -1, true, output.ToString());
+        }
+
+        process.WaitForExit();
+
+        string outText;
+        lock (output)
+        {
+            outText = output.ToString();
+        }
+
+        bool foundTarget = outText.Contains("Target device", StringComparison.OrdinalIgnoreCase)
+                        && outText.Contains(" found.", StringComparison.OrdinalIgnoreCase);
+        bool programSucceeded = outText.Contains("Program succeeded", StringComparison.OrdinalIgnoreCase)
+                             || outText.Contains("Programming/Verify complete", StringComparison.OrdinalIgnoreCase);
+        bool failed = outText.Contains("Program failed", StringComparison.OrdinalIgnoreCase)
+                   || outText.Contains("Programming failed", StringComparison.OrdinalIgnoreCase)
+                   || outText.Contains("Target device not found", StringComparison.OrdinalIgnoreCase)
+                   || outText.Contains("No tool", StringComparison.OrdinalIgnoreCase);
+        bool ok = foundTarget && programSucceeded && !failed;
+
+        return new MdbResult(ok, process.ExitCode, false, outText);
+    }
+
+    private static string Quote(string value)
+    {
+        return "\"" + value.Replace("\"", "\\\"") + "\"";
+    }
+}
