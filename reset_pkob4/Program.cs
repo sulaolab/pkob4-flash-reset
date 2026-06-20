@@ -12,7 +12,8 @@
 // (stdin is closed = the script's "< NUL", which avoids a boost stdin wait.)
 //
 // Exit codes: 0 success, 1 invalid args, 2 MPLAB X/Java/Boost not found,
-//             3 boost reset failed, 4 timeout after retry, 5 unexpected exception.
+//             3 boost reset failed, 4 timeout after retry, 5 unexpected exception,
+//             6 PKOB4 wedged (USB unplug/replug required -- not retryable).
 
 using System.Diagnostics;
 using System.Management;
@@ -47,12 +48,16 @@ internal static class Program
         int retry = 1;
         bool verbose = false;
         bool dryRun = false;
+        bool list = false;
+        bool probe = false;
 
         for (int i = 0; i < args.Length; i++)
         {
             string a = args[i];
             switch (a)
             {
+                case "--list":    list = true; break;
+                case "--probe":   probe = true; break;
                 case "--serial":  serial = NextArg(args, ref i); break;
                 case "--device":  device = NextArg(args, ref i); break;
                 case "--timeout": if (!int.TryParse(NextArg(args, ref i), out timeoutSec) || timeoutSec <= 0) return Invalid("--timeout must be a positive integer (seconds)"); break;
@@ -63,6 +68,23 @@ internal static class Program
                 default: return Invalid($"unknown argument: {a}");
             }
         }
+
+        // Guard a very common mistake: boost/ipecmd want the SHORT device token
+        // (e.g. 33AK512MPS512). The MPLAB IDE / MDB form 'dsPIC33AK512MPS512' gets
+        // turned into 'PICDSPIC...' by ipecmd and the connect fails confusingly.
+        // Point out the fix and stop, rather than running into that failure.
+        if (TryStripPicPrefix(device, out string shortDev))
+        {
+            Console.Error.WriteLine($"Invalid arguments: --device '{device}' is the MPLAB IDE/MDB form.");
+            Console.Error.WriteLine($"IPECMDBoost expects the short token (no 'dsPIC'/'PIC' prefix).");
+            Console.Error.WriteLine($"Did you mean:  --device {shortDev}");
+            return 1;
+        }
+
+        // --list enumerates connected PKOB4 serials and exits (no serial needed).
+        // With --probe it also connects to each board to report its device token.
+        if (list)
+            return ListPkob4(probe, device, timeoutSec, verbose);
 
         if (string.IsNullOrWhiteSpace(serial))
             return Invalid("--serial <PKOB4 serial> is required");
@@ -116,6 +138,18 @@ internal static class Program
             if (verbose)
                 Console.WriteLine($"ExitCode: {result.ExitCode}{(result.TimedOut ? " (timeout)" : "")}");
 
+            // Non-retryable: the PKOB4 firmware reported it was unloaded while busy.
+            // No amount of host-side cleanup/retry clears this -- the USB device
+            // itself must be re-enumerated. Bail out immediately with clear guidance
+            // instead of retrying into a hang.
+            if (LooksWedged(result.Output))
+            {
+                Console.WriteLine("PKOB4 appears wedged: boost reported the USB tool was unloaded while still busy.");
+                Console.WriteLine("Serial: " + serial);
+                Console.WriteLine("Fix: unplug and reconnect the PKOB4 USB cable, then retry (retrying alone will not clear this).");
+                return 6;
+            }
+
             if (result.Ok)
             {
                 Console.WriteLine(attempt > 1
@@ -147,6 +181,23 @@ internal static class Program
         return args[++i];
     }
 
+    // The boost device token is the short form (e.g. 33AK512MPS512). If the caller
+    // passed the IDE/MDB form ('dsPIC33AK512MPS512' / 'PIC33...'), return true and
+    // the corrected short token in 'shortForm'. Otherwise false.
+    static bool TryStripPicPrefix(string device, out string shortForm)
+    {
+        shortForm = device;
+        foreach (string pfx in new[] { "dsPIC", "PIC" })
+        {
+            if (device.StartsWith(pfx, StringComparison.OrdinalIgnoreCase))
+            {
+                shortForm = device.Substring(pfx.Length);
+                return true;
+            }
+        }
+        return false;
+    }
+
     static int Invalid(string msg)
     {
         Console.Error.WriteLine("Invalid arguments: " + msg);
@@ -159,12 +210,99 @@ internal static class Program
         Console.WriteLine("reset_pkob4 - reset one PKOB4-attached target by serial via MPLAB X IPECMDBoost.");
         Console.WriteLine();
         Console.WriteLine("Usage: reset_pkob4 --serial <SERIAL> [options]");
+        Console.WriteLine("       reset_pkob4 --list [--probe] [--device <dev>]");
+        Console.WriteLine("  --list           list connected PKOB4 serial numbers and exit");
+        Console.WriteLine("  --probe          with --list: also connect to each board and report its");
+        Console.WriteLine("                   device token + Device Id (RESETS each board; needs --device)");
         Console.WriteLine("  --serial  <sn>   PKOB4 serial number (required), e.g. 020085204RYN000318");
         Console.WriteLine("  --device  <dev>  device token (default 33AK512MPS512)");
         Console.WriteLine("  --timeout <sec>  per-attempt timeout (default 15)");
         Console.WriteLine("  --retry   <n>    retries after the first attempt (default 1)");
         Console.WriteLine("  --verbose        print detected paths, command and exit code");
         Console.WriteLine("  --dry-run        print what would run, do nothing");
+    }
+
+    // Enumerate connected PKOB4 debuggers (USB VID_04D8 & PID_810B) and return
+    // their serials. The serial is the third '\'-separated segment of the
+    // composite device's instance id; child interface nodes (...&MI_xx\...) are
+    // skipped. This is USB enumeration only -- instant and side-effect free.
+    static SortedSet<string> EnumeratePkob4Serials(out string? err)
+    {
+        err = null;
+        var serials = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            using var searcher = new ManagementObjectSearcher(
+                "SELECT DeviceID FROM Win32_PnPEntity WHERE DeviceID LIKE '%VID_04D8&PID_810B%'");
+            foreach (ManagementBaseObject mo in searcher.Get())
+            {
+                string id = mo["DeviceID"]?.ToString() ?? "";
+                string[] parts = id.Split('\\');
+                if (parts.Length == 3 && parts[2].Length > 0 && parts[2].IndexOf('&') < 0)
+                    serials.Add(parts[2]);
+            }
+        }
+        catch (Exception ex) { err = ex.Message; }
+        return serials;
+    }
+
+    // --list [--probe]. Without --probe: print serials only (instant, no target
+    // contact). With --probe: additionally connect to each board with the expected
+    // device token and print its device name + Device Id. NOTE: probing RESETS each
+    // board and briefly drops its USB-CDC console; it can only confirm the given
+    // token (a USB serial scan cannot reveal an unknown target on its own), and it
+    // is serialized so only one boost server uses the port at a time.
+    static int ListPkob4(bool probe, string device, int timeoutSec, bool verbose)
+    {
+        var serials = EnumeratePkob4Serials(out string? enumErr);
+        if (enumErr != null)
+        {
+            Console.Error.WriteLine("Could not enumerate PKOB4 devices: " + enumErr);
+            return 2;
+        }
+        if (serials.Count == 0)
+        {
+            Console.WriteLine("No PKOB4 debugger found (USB VID_04D8&PID_810B). Is a board connected?");
+            return 3;
+        }
+
+        if (!probe)
+        {
+            Console.WriteLine($"Connected PKOB4 serial(s): {serials.Count}");
+            foreach (string s in serials)
+                Console.WriteLine("  " + s);
+            return 0;
+        }
+
+        // --probe: connect to each board to read its device token.
+        if (!TryDetectMplab(out _, out string javaExe, out string boostJar, out string detectErr))
+        {
+            Console.Error.WriteLine("MPLAB X / Java / IPECMDBoost not found (needed for --probe).");
+            Console.Error.WriteLine("Reason: " + detectErr);
+            return 2;
+        }
+
+        Console.WriteLine($"Connected PKOB4: {serials.Count}  (probing with device token '{device}' -- this resets each board)");
+        foreach (string s in serials)
+        {
+            // Serialize: clear any boost server/state so only one uses the port.
+            KillStaleBoostJava(false, new List<string>());
+            CleanBoostState(false, new List<string>());
+
+            string args = $"-jar \"{boostJar}\" /P{device} /TP{ToolType} /TS{s} /OK /OL /OY{BoostPort}";
+            var r = RunBoost(javaExe, args, timeoutSec, verbose);
+
+            string detail;
+            if (LooksWedged(r.Output))
+                detail = "(PKOB4 wedged -- unplug/replug USB)";
+            else if (TryParseDeviceInfo(r.Output, out string name, out string id))
+                detail = $"{(name.Length > 0 ? name : "?")}   Device Id {(id.Length > 0 ? id : "?")}";
+            else
+                detail = $"(no match for token '{device}'{(r.TimedOut ? ", timed out" : "")})";
+
+            Console.WriteLine($"  {s}   {detail}");
+        }
+        return 0;
     }
 
     // Enumerate C:\Program Files\Microchip\MPLABX\v* (newest first) and pick the
@@ -310,21 +448,57 @@ internal static class Program
         p.BeginErrorReadLine();
         try { p.StandardInput.Close(); } catch { /* = "< NUL": child gets stdin EOF */ }
 
+        bool timedOut = false;
         if (!p.WaitForExit(timeoutSec * 1000))
         {
             try { p.Kill(entireProcessTree: true); } catch { }
             try { p.WaitForExit(3000); } catch { }
-            return new BoostResult(false, -1, true, sb.ToString());
+            timedOut = true;
         }
-        p.WaitForExit(); // let async output handlers drain
+        else
+        {
+            p.WaitForExit(); // let async output handlers drain
+        }
 
         string outText;
         lock (sb) outText = sb.ToString();
+
+        // Make sure no detached boost server (a separate /OY<port> java daemon)
+        // lingers after we return. Such a survivor would (a) hold the boost port
+        // for the next run and (b) keep our redirected stdout pipe open, which can
+        // make the *calling* shell appear to hang long after the reset finished.
+        // Killing it here is the difference between "the tool always returns" and
+        // "Java occasionally wedges the workflow".
+        KillStaleBoostJava(false, new List<string>());
+
+        if (timedOut)
+            return new BoostResult(false, -1, true, outText);
 
         // Boost may leave a lingering JVM and exit non-zero even on success, so accept
         // either a clean exit code or the explicit success marker in the output.
         bool ok = p.ExitCode == 0
                || outText.Contains("Operation Succeeded", StringComparison.OrdinalIgnoreCase);
         return new BoostResult(ok, p.ExitCode, false, outText);
+    }
+
+    // True if boost output indicates the PKOB4 was unloaded/wedged mid-operation,
+    // a state only a USB re-enumeration (unplug/replug) clears -- never retry into it.
+    static bool LooksWedged(string output)
+    {
+        return output.IndexOf("unloaded while still busy", StringComparison.OrdinalIgnoreCase) >= 0
+            || output.IndexOf("unplug and reconnect", StringComparison.OrdinalIgnoreCase) >= 0
+            || output.IndexOf("terminated abruptly", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    // Pull the target device name / Device Id out of a boost connect's output.
+    static bool TryParseDeviceInfo(string output, out string name, out string id)
+    {
+        name = "";
+        id = "";
+        var mName = System.Text.RegularExpressions.Regex.Match(output, @"Target device\s+(\S+)\s+found");
+        if (mName.Success) name = mName.Groups[1].Value;
+        var mId = System.Text.RegularExpressions.Regex.Match(output, @"Device Id\s*=\s*(0x[0-9A-Fa-f]+)");
+        if (mId.Success) id = mId.Groups[1].Value;
+        return name.Length > 0 || id.Length > 0;
     }
 }

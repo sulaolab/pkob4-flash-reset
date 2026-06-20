@@ -87,16 +87,33 @@ Common options (see each subfolder README for the full list and exit codes):
   `reset_pkob4` default `33AK512MPS512`).
 - `--timeout <sec>`, `--retry <n>`, `--verbose`, `--dry-run`.
 
-### Finding a board's PKOB4 serial
+### Finding a board's PKOB4 serial (and device token)
 
-```powershell
-Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -match 'RYN' } |
-  Select-Object FriendlyName, InstanceId
+Both tools take `--list` to enumerate the connected PKOB4 serials — instant and
+side-effect free (a USB scan):
+
+```sh
+reset_pkob4 --list        # or: flash_pkob4 --list
+# Connected PKOB4 serial(s): 1
+#   020085204RYN000057
 ```
 
-The serial is the tail of the USB instance id (PKOB4 = `VID_04D8&PID_810B`). It is
-also shown in the MPLAB X tool list and in flashing logs. A PKOB4 serial is not a
-secret — it is printed on the debugger.
+`reset_pkob4` additionally takes `--list --probe` to report each board's **device
+token + Device Id** by briefly connecting to it:
+
+```sh
+reset_pkob4 --list --probe            # uses --device (default 33AK512MPS512)
+# Connected PKOB4: 1  (probing with device token '33AK512MPS512' -- this resets each board)
+#   020085204RYN000057   dsPIC33AK512MPS512   Device Id 0xa77c
+```
+
+`--probe` **resets each probed board** and briefly drops its USB-CDC console (it
+has to connect to the target to read the device id), so it is opt-in. It confirms
+the expected `--device` token rather than discovering an arbitrary unknown part. A
+plain `--list` does neither — it only reads the USB serial. (You can also get the
+serial from the MPLAB X tool list, flashing logs, or
+`Get-PnpDevice -PresentOnly | ? { $_.InstanceId -match 'RYN' }`.) A PKOB4 serial
+is not a secret — it is printed on the debugger.
 
 ### Notes
 
@@ -105,6 +122,13 @@ secret — it is printed on the debugger.
 - `reset_pkob4` self-clears a stuck `IPECMDBoost` server (stale lock/ini + hung
   boost `java`) before each attempt and reports what it cleaned, so a transient
   boost hang no longer wedges the workflow.
+- It also kills any **detached** boost server after each run (so a lingering JVM
+  can neither hold the boost port nor keep the tool's output pipe open) — the tool
+  always returns rather than appearing to hang.
+- If the PKOB4 firmware itself gets wedged (boost reports *"unloaded while still
+  busy / unplug and reconnect"*), `reset_pkob4` detects this, stops retrying into
+  a hang, and tells you to unplug/replug the USB cable (exit code 6). Only a USB
+  re-enumeration clears that device-side state.
 
 ## License
 

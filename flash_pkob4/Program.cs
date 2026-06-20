@@ -42,12 +42,14 @@ internal static class Program
         int retry = 0;
         bool verbose = false;
         bool dryRun = false;
+        bool list = false;
 
         for (int i = 0; i < args.Length; i++)
         {
             string arg = args[i];
             switch (arg)
             {
+                case "--list": list = true; break;
                 case "--serial": serial = NextArg(args, ref i); break;
                 case "--hex": hex = NextArg(args, ref i); break;
                 case "--device": device = NextArg(args, ref i); break;
@@ -72,6 +74,12 @@ internal static class Program
                 default:
                     return Invalid("unknown argument: " + arg);
             }
+        }
+
+        // --list just enumerates connected PKOB4 serials and exits (no serial/hex needed).
+        if (list)
+        {
+            return ListPkob4();
         }
 
         if (string.IsNullOrWhiteSpace(serial))
@@ -194,6 +202,8 @@ internal static class Program
         Console.WriteLine("flash_pkob4 - flash one PKOB4-attached target by serial via MPLAB X mdb.");
         Console.WriteLine();
         Console.WriteLine("Usage: flash_pkob4 --serial <SERIAL> --hex <HEX> [options]");
+        Console.WriteLine("       flash_pkob4 --list");
+        Console.WriteLine("  --list            list connected PKOB4 serial numbers and exit");
         Console.WriteLine("  --serial  <sn>    PKOB4 serial number (required), e.g. 020085204RYN000318");
         Console.WriteLine("  --hex     <path>  HEX file to program (required)");
         Console.WriteLine("  --device  <dev>   MDB device token (default dsPIC33AK512MPS512)");
@@ -201,6 +211,47 @@ internal static class Program
         Console.WriteLine("  --retry   <n>     retries after the first attempt (default 0)");
         Console.WriteLine("  --verbose         print detected paths, script, output and exit code");
         Console.WriteLine("  --dry-run         print what would run, do not program");
+    }
+
+    // List connected PKOB4 debuggers (USB VID_04D8 & PID_810B) and their serials,
+    // so the user can discover the value to pass to --serial. The serial is the
+    // third '\'-separated segment of the composite device's instance id; child
+    // interface nodes (…&MI_xx\…) are skipped.
+    private static int ListPkob4()
+    {
+        var serials = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            using var searcher = new System.Management.ManagementObjectSearcher(
+                "SELECT DeviceID FROM Win32_PnPEntity WHERE DeviceID LIKE '%VID_04D8&PID_810B%'");
+            foreach (System.Management.ManagementBaseObject mo in searcher.Get())
+            {
+                string id = mo["DeviceID"]?.ToString() ?? "";
+                string[] parts = id.Split('\\');
+                if (parts.Length == 3 && parts[2].Length > 0 && parts[2].IndexOf('&') < 0)
+                {
+                    serials.Add(parts[2]);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("Could not enumerate PKOB4 devices: " + ex.Message);
+            return 2;
+        }
+
+        if (serials.Count == 0)
+        {
+            Console.WriteLine("No PKOB4 debugger found (USB VID_04D8&PID_810B). Is a board connected?");
+            return 3;
+        }
+
+        Console.WriteLine($"Connected PKOB4 serial(s): {serials.Count}");
+        foreach (string s in serials)
+        {
+            Console.WriteLine("  " + s);
+        }
+        return 0;
     }
 
     private static bool TryDetectMdb(out string mplabRoot, out string mdbBat, out string err)

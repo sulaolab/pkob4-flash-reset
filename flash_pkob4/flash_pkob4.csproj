@@ -14,4 +14,9 @@
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
   </PropertyGroup>
 
+  <ItemGroup>
+    <!-- For enumerating connected PKOB4 debuggers (the list option) via WMI on Windows. -->
+    <PackageReference Include="System.Management" Version="8.0.0" />
+  </ItemGroup>
+
 </Project>

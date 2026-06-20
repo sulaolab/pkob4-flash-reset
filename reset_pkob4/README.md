@@ -24,15 +24,23 @@ On a board where the printf console runs over the PKOB4 USB-CDC:
 
 ```
 reset_pkob4 --serial <PKOB4_SERIAL> [options]
+reset_pkob4 --list [--probe] [--device <dev>]
 
-  --serial  <sn>   PKOB4 serial number (required), e.g. 020085204RYN000318
-  --device  <dev>  device token            (default 33AK512MPS512)
-  --timeout <sec>  per-attempt timeout      (default 5)
+  --list           list connected PKOB4 serial numbers and exit (instant, no target contact)
+  --probe          with --list: also connect to each board and print its device
+                   token + Device Id (RESETS each board; confirms the --device token)
+  --serial  <sn>   PKOB4 serial number (required for reset), e.g. 020085204RYN000318
+  --device  <dev>  device token            (default 33AK512MPS512; SHORT form, no 'dsPIC' prefix)
+  --timeout <sec>  per-attempt timeout      (default 15)
   --retry   <n>    retries after attempt 1  (default 1)
   --verbose        print detected paths, the command and the exit code
   --dry-run        print what would run, do nothing
   -h, --help       usage
 ```
+
+`--device` takes the **short** boost token (`33AK512MPS512`). If you pass the
+MPLAB IDE/MDB form (`dsPIC33AK512MPS512`), the tool stops with exit 1 and suggests
+the short form rather than running into a confusing boost failure.
 
 Examples:
 
@@ -69,7 +77,15 @@ and `2012.ini`, and kills only `java.exe` whose command line contains
 3  Boost reset failed
 4  timeout after retry
 5  unexpected exception
+6  PKOB4 wedged -- USB unplug/replug required (not retryable)
 ```
+
+Exit 6 is raised when boost reports the tool was *"unloaded while still busy /
+unplug and reconnect"*: a device-side state that no host cleanup or retry can
+clear. The tool detects it, stops retrying into a hang, and tells you to
+re-seat the USB cable. (It also kills any detached boost server after each run so
+a lingering JVM never holds the port or the output pipe — the tool always
+returns.)
 
 ## Build
 

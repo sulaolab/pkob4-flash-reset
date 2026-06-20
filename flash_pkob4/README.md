@@ -23,7 +23,9 @@ temporary-script cleanup and success-marker checking.
 
 ```text
 flash_pkob4 --serial <PKOB4_SERIAL> --hex <HEX_FILE> [options]
+flash_pkob4 --list
 
+  --list            list connected PKOB4 serial numbers and exit (instant, no target contact)
   --serial  <sn>    PKOB4 serial number (required), e.g. 020085204RYN000318
   --hex     <path>  HEX file to program (required)
   --device  <dev>   MDB device token       (default dsPIC33AK512MPS512)
@@ -33,6 +35,10 @@ flash_pkob4 --serial <PKOB4_SERIAL> --hex <HEX_FILE> [options]
   --dry-run         print what would run, do not program
   -h, --help        usage
 ```
+
+`--list` only reads PKOB4 USB serials. To also see each board's device token /
+Device Id, use `reset_pkob4 --list --probe` (it connects to the target, which
+resets it).
 
 Examples:
 
