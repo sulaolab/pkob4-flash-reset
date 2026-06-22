@@ -31,7 +31,7 @@ reset_pkob4 --list [--probe] [--device <dev>]
                    token + Device Id (RESETS each board; confirms the --device token)
   --serial  <sn>   PKOB4 serial number (required for reset), e.g. 020085204RYN000318
   --device  <dev>  device token            (default 33AK512MPS512; SHORT form, no 'dsPIC' prefix)
-  --timeout <sec>  per-attempt timeout      (default 15)
+  --timeout <sec>  per-attempt timeout      (default 15; --list --probe default 60)
   --retry   <n>    retries after attempt 1  (default 1)
   --verbose        print detected paths, the command and the exit code
   --dry-run        print what would run, do nothing
@@ -48,6 +48,7 @@ Examples:
 reset_pkob4 --serial 020085204RYN000318
 reset_pkob4 --serial 020085204RYN000318 --device 33AK512MPS512 --timeout 15 --retry 2
 reset_pkob4 --serial 020085204RYN000318 --dry-run --verbose
+reset_pkob4 --list --probe
 ```
 
 Find a board's PKOB4 serial with MPLAB X, or with mdb (`hwtool pkob4` lists tools),
@@ -67,6 +68,11 @@ tool selection:
 Before each attempt it removes the stale boost state `%USERPROFILE%\.mchp_ipe\2012.lock`
 and `2012.ini`, and kills only `java.exe` whose command line contains
 `ipecmdboost.jar`. On timeout it kills the launched Java process tree and retries.
+
+For `--list --probe`, the default per-board timeout is 60 seconds instead of 15.
+Probe performs a real target connection and may include Java / IPECMDBoost /
+PKOB4 cold-start time; successful warm probes still return as soon as Boost
+finishes, so the higher cap does not slow down healthy runs.
 
 ## Exit codes
 

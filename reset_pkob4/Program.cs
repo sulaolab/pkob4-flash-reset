@@ -50,6 +50,7 @@ internal static class Program
         bool dryRun = false;
         bool list = false;
         bool probe = false;
+        bool timeoutExplicit = false;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -60,7 +61,10 @@ internal static class Program
                 case "--probe":   probe = true; break;
                 case "--serial":  serial = NextArg(args, ref i); break;
                 case "--device":  device = NextArg(args, ref i); break;
-                case "--timeout": if (!int.TryParse(NextArg(args, ref i), out timeoutSec) || timeoutSec <= 0) return Invalid("--timeout must be a positive integer (seconds)"); break;
+                case "--timeout":
+                    if (!int.TryParse(NextArg(args, ref i), out timeoutSec) || timeoutSec <= 0) return Invalid("--timeout must be a positive integer (seconds)");
+                    timeoutExplicit = true;
+                    break;
                 case "--retry":   if (!int.TryParse(NextArg(args, ref i), out retry) || retry < 0) return Invalid("--retry must be >= 0"); break;
                 case "--verbose": verbose = true; break;
                 case "--dry-run": dryRun = true; break;
@@ -80,6 +84,12 @@ internal static class Program
             Console.Error.WriteLine($"Did you mean:  --device {shortDev}");
             return 1;
         }
+
+        // Probe performs a real target connection and can include Java/Boost/PKOB4
+        // cold-start time. Keep normal reset fast, but make probe tolerant unless
+        // the caller explicitly chose a timeout.
+        if (list && probe && !timeoutExplicit)
+            timeoutSec = 60;
 
         // --list enumerates connected PKOB4 serials and exits (no serial needed).
         // With --probe it also connects to each board to report its device token.
@@ -216,7 +226,7 @@ internal static class Program
         Console.WriteLine("                   device token + Device Id (RESETS each board; needs --device)");
         Console.WriteLine("  --serial  <sn>   PKOB4 serial number (required), e.g. 020085204RYN000318");
         Console.WriteLine("  --device  <dev>  device token (default 33AK512MPS512)");
-        Console.WriteLine("  --timeout <sec>  per-attempt timeout (default 15)");
+        Console.WriteLine("  --timeout <sec>  per-attempt timeout (default 15; --list --probe default 60)");
         Console.WriteLine("  --retry   <n>    retries after the first attempt (default 1)");
         Console.WriteLine("  --verbose        print detected paths, command and exit code");
         Console.WriteLine("  --dry-run        print what would run, do nothing");
