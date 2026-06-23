@@ -144,8 +144,13 @@ is not a secret — it is printed on the debugger.
 - A reset re-enumerates the PKOB4 USB, so a serial/CDC console (e.g. Tera Term)
   briefly drops and must reconnect after each reset — expected, not a fault.
 - `reset_pkob4` self-clears a stuck `IPECMDBoost` server (stale lock/ini + hung
-  boost `java`) before each attempt and reports what it cleaned, so a transient
-  boost hang no longer wedges the workflow.
+  boost `java`, including whatever java owns boost port 2012 — found by owning PID,
+  so it works without elevation) before each attempt and reports what it cleaned, so
+  a transient boost hang no longer wedges the workflow.
+- Stuck-state escape hatches (no target contact): `reset_pkob4 --check-java` gives a
+  fast verdict (boost java age, who holds port 2012, stale lock/ini; exit 8 = stuck),
+  and `reset_pkob4 --clean-java` kills the stuck boost java + clears the stale state.
+  Opt-in — a normal reset already runs the same cleanup.
 - It also kills any **detached** boost server after each run (so a lingering JVM
   can neither hold the boost port nor keep the tool's output pipe open) — the tool
   always returns rather than appearing to hang.

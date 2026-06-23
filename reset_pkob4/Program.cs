@@ -13,10 +13,13 @@
 //
 // Exit codes: 0 success, 1 invalid args, 2 MPLAB X/Java/Boost not found,
 //             3 boost reset failed, 4 timeout after retry, 5 unexpected exception,
-//             6 PKOB4 wedged (USB unplug/replug required -- not retryable).
+//             6 PKOB4 wedged (USB unplug/replug required -- not retryable),
+//             8 --check-java only: a stuck boost state was detected.
 
 using System.Diagnostics;
 using System.Management;
+using System.Net.NetworkInformation;
+using System.Runtime.InteropServices;
 using System.Text;
 
 internal static class Program
@@ -51,6 +54,8 @@ internal static class Program
         bool list = false;
         bool probe = false;
         bool timeoutExplicit = false;
+        bool cleanJava = false;
+        bool checkJava = false;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -59,6 +64,9 @@ internal static class Program
             {
                 case "--list":    list = true; break;
                 case "--probe":   probe = true; break;
+                case "--clean-java": cleanJava = true; break;
+                case "--check-java":
+                case "--doctor":  checkJava = true; break;
                 case "--serial":  serial = NextArg(args, ref i); break;
                 case "--device":  device = NextArg(args, ref i); break;
                 case "--timeout":
@@ -72,6 +80,12 @@ internal static class Program
                 default: return Invalid($"unknown argument: {a}");
             }
         }
+
+        // Java maintenance modes (no target contact, no --serial needed). These are
+        // opt-in escape hatches for when a stale IPECMDBoost server (port 2012) wedges
+        // the workflow -- not for routine use (every reset already self-cleans).
+        if (checkJava) return CheckJava(verbose);
+        if (cleanJava) return CleanJava(verbose);
 
         // Guard a very common mistake: boost/ipecmd want the SHORT device token
         // (e.g. 33AK512MPS512). The MPLAB IDE / MDB form 'dsPIC33AK512MPS512' gets
@@ -138,6 +152,7 @@ internal static class Program
             // --verbose) so the operational state is visible after the fact.
             var cleanup = new List<string>();
             KillStaleBoostJava(verbose, cleanup);
+            KillBoostPortOwner(verbose, cleanup);   // catches the WMI-invisible boost java still holding port 2012
             CleanBoostState(verbose, cleanup);
             if (cleanup.Count > 0)
                 Console.WriteLine($"Cleanup (attempt {attempt}): " + string.Join("; ", cleanup));
@@ -221,6 +236,11 @@ internal static class Program
         Console.WriteLine();
         Console.WriteLine("Usage: reset_pkob4 --serial <SERIAL> [options]");
         Console.WriteLine("       reset_pkob4 --list [--probe] [--device <dev>]");
+        Console.WriteLine("       reset_pkob4 --check-java | --clean-java");
+        Console.WriteLine("  --check-java     fast, side-effect-free check for a stuck IPECMDBoost server");
+        Console.WriteLine("                   (boost java age, port " + BoostPort + ", stale lock/ini); exit 8 = stuck");
+        Console.WriteLine("  --clean-java     kill a stuck boost java + remove stale lock/ini, then exit");
+        Console.WriteLine("                   (opt-in escape hatch; a normal reset already self-cleans)");
         Console.WriteLine("  --list           list connected PKOB4 serial numbers and exit");
         Console.WriteLine("  --probe          with --list: also connect to each board and report its");
         Console.WriteLine("                   device token + Device Id (RESETS each board; needs --device)");
@@ -431,6 +451,203 @@ internal static class Program
             }
         }
         catch (Exception ex) { if (verbose) Console.WriteLine("  (stale-java scan skipped: " + ex.Message + ")"); }
+    }
+
+    // ------------------------------------------------ java health: scan / check / clean
+
+    // Read-only scan of the boost-server java processes (same match rule as
+    // KillStaleBoostJava), with each one's age in seconds. Instant, side-effect free.
+    readonly record struct BoostJavaProc(int Pid, double AgeSec, bool CmdVisible, bool IsBoostCmd);
+
+    static List<BoostJavaProc> ScanBoostJava()
+    {
+        var list = new List<BoostJavaProc>();
+        try
+        {
+            using var searcher = new ManagementObjectSearcher(
+                "SELECT ProcessId, CommandLine, ExecutablePath FROM Win32_Process WHERE Name = 'java.exe'");
+            foreach (ManagementBaseObject mo in searcher.Get())
+            {
+                var cmd = mo["CommandLine"]?.ToString() ?? "";
+                var exe = mo["ExecutablePath"]?.ToString() ?? "";
+
+                bool isBoost = cmd.IndexOf("ipecmdboost.jar", StringComparison.OrdinalIgnoreCase) >= 0;
+                bool maybeBoost = string.IsNullOrEmpty(cmd)
+                    && exe.IndexOf(@"\MPLABX\", StringComparison.OrdinalIgnoreCase) >= 0
+                    && exe.IndexOf(@"\sys\java\", StringComparison.OrdinalIgnoreCase) >= 0;
+                if (!isBoost && !maybeBoost) continue;
+
+                int pid = Convert.ToInt32(mo["ProcessId"]);
+                double age = -1;
+                try { using var p = Process.GetProcessById(pid); age = (DateTime.Now - p.StartTime).TotalSeconds; }
+                catch { /* StartTime can be inaccessible; report age unknown */ }
+
+                list.Add(new BoostJavaProc(pid, age, !string.IsNullOrEmpty(cmd), isBoost));
+            }
+        }
+        catch { /* WMI unavailable -> empty list */ }
+        return list;
+    }
+
+    // True if a TCP listener is bound to the boost port (i.e. a boost server is up).
+    static bool IsBoostPortListening()
+    {
+        try
+        {
+            foreach (var ep in IPGlobalProperties.GetIPGlobalProperties().GetActiveTcpListeners())
+                if (ep.Port == BoostPort) return true;
+        }
+        catch { /* not enumerable -> treat as not listening */ }
+        return false;
+    }
+
+    [DllImport("iphlpapi.dll", SetLastError = true)]
+    static extern uint GetExtendedTcpTable(IntPtr pTcpTable, ref int pdwSize, bool sort,
+                                           int ipVersion, int tableClass, int reserved);
+
+    // PID that OWNS the boost listening port (IPv4), or null. This is the authoritative
+    // "who is the boost server" signal -- far more reliable than matching a java process
+    // by its WMI CommandLine/ExecutablePath, which are EMPTY for an MPLAB X-owned java
+    // when we are not elevated (the reason a stale boost java used to be missed, leaving
+    // the port held and the next reset failing). Uses GetExtendedTcpTable
+    // (TCP_TABLE_OWNER_PID_LISTENER); no child process, locale-independent.
+    static int? GetBoostPortOwnerPid()
+    {
+        const int AF_INET = 2;
+        const int TCP_TABLE_OWNER_PID_LISTENER = 3;
+        int size = 0;
+        GetExtendedTcpTable(IntPtr.Zero, ref size, true, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0);
+        if (size <= 0) return null;
+        IntPtr buf = Marshal.AllocHGlobal(size);
+        try
+        {
+            if (GetExtendedTcpTable(buf, ref size, true, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0) != 0)
+                return null;
+            int num = Marshal.ReadInt32(buf);
+            IntPtr row = buf + 4;
+            for (int i = 0; i < num; i++)   // MIB_TCPROW_OWNER_PID = 6 DWORDs (24 bytes)
+            {
+                int localPortRaw = Marshal.ReadInt32(row, 8);   // network byte order, low word
+                int localPort = ((localPortRaw & 0xFF) << 8) | ((localPortRaw >> 8) & 0xFF);
+                int pid = Marshal.ReadInt32(row, 20);
+                if (localPort == BoostPort) return pid;
+                row += 24;
+            }
+        }
+        catch { /* fall through */ }
+        finally { Marshal.FreeHGlobal(buf); }
+        return null;
+    }
+
+    // Kill the process that owns the boost port, if it is a java (the boost server).
+    // Owning our dedicated boost port IS the signal -- this catches the WMI-invisible
+    // boost java that KillStaleBoostJava (cmdline/exe match) cannot see. We still
+    // require ProcessName == java so we never kill some unrelated owner.
+    static void KillBoostPortOwner(bool verbose, List<string> report)
+    {
+        int? pid = GetBoostPortOwnerPid();
+        if (pid == null) return;
+        try
+        {
+            using var p = Process.GetProcessById(pid.Value);
+            if (!p.ProcessName.Equals("java", StringComparison.OrdinalIgnoreCase))
+            {
+                if (verbose) Console.WriteLine($"  port {BoostPort} owner PID={pid} is '{p.ProcessName}', not java -- not killing");
+                return;
+            }
+            p.Kill(entireProcessTree: true);
+            report.Add($"killed boost port {BoostPort} owner java PID={pid}");
+            if (verbose) Console.WriteLine($"  killed boost port {BoostPort} owner java PID={pid}");
+        }
+        catch { /* already gone / no access */ }
+    }
+
+    static bool BoostStateFileExists(string ext)
+    {
+        var ipeState = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".mchp_ipe");
+        return File.Exists(Path.Combine(ipeState, $"{BoostPort}.{ext}"));
+    }
+
+    // --check-java / --doctor: fast, side-effect-free verdict on whether a stuck boost
+    // server is the problem. A healthy boost run returns in ~2-3s, so a boost java that
+    // has been alive much longer -- or a held port / leftover lock|ini -- is the
+    // signature of a wedged server. Exit 0 = clean, 8 = stuck state detected.
+    const double StuckAgeSec = 15;
+
+    static int CheckJava(bool verbose)
+    {
+        var procs = ScanBoostJava();
+        bool ini  = BoostStateFileExists("ini");
+        bool lck  = BoostStateFileExists("lock");
+        int? ownerPid = GetBoostPortOwnerPid();
+        bool oldProc = procs.Any(p => p.AgeSec >= StuckAgeSec);
+
+        Console.WriteLine("PKOB4 boost/java health check:");
+        Console.WriteLine($"  boost java processes (cmdline-visible) : {procs.Count}");
+        foreach (var p in procs)
+        {
+            string age = p.AgeSec < 0 ? "age=?" : $"age={p.AgeSec:F0}s";
+            string src = p.IsBoostCmd ? "ipecmdboost.jar" : "MPLABX-bundled (cmdline hidden)";
+            string flag = p.AgeSec >= StuckAgeSec ? $"  <-- older than {StuckAgeSec:F0}s (likely stuck)" : "";
+            Console.WriteLine($"    PID={p.Pid} {age} {src}{flag}");
+        }
+        if (ownerPid != null)
+        {
+            string who = "java";
+            double age = -1;
+            try { using var op = Process.GetProcessById(ownerPid.Value); who = op.ProcessName; age = (DateTime.Now - op.StartTime).TotalSeconds; } catch { }
+            string ageStr = age < 0 ? "age=?" : $"age={age:F0}s";
+            Console.WriteLine($"  boost port {BoostPort} owner    : PID={ownerPid} ({who}, {ageStr})  <-- authoritative boost-server signal");
+        }
+        else
+        {
+            Console.WriteLine($"  boost port {BoostPort} owner    : none (port free)");
+        }
+        Console.WriteLine($"  stale {BoostPort}.ini   : {(ini ? "present" : "no")}");
+        Console.WriteLine($"  stale {BoostPort}.lock  : {(lck ? "present" : "no")}");
+
+        bool stuck = ownerPid != null || ini || lck || oldProc;
+        if (stuck)
+        {
+            var why = new List<string>();
+            if (ownerPid != null) why.Add($"port {BoostPort} held by PID={ownerPid}");
+            if (oldProc) why.Add($"a boost java older than {StuckAgeSec:F0}s");
+            if (ini)     why.Add($"{BoostPort}.ini present");
+            if (lck)     why.Add($"{BoostPort}.lock present");
+            Console.WriteLine("Verdict: STUCK boost state detected (" + string.Join(", ", why) + ").");
+            Console.WriteLine("Fix: run 'reset_pkob4 --clean-java' (a normal reset also self-cleans before each attempt).");
+            Console.WriteLine("If it persists after --clean-java, the PKOB4 itself is wedged: unplug/replug the USB cable.");
+            return 8;
+        }
+        if (procs.Count > 0)
+        {
+            Console.WriteLine("Verdict: a boost java is present but looks transient (recent, no held port/lock).");
+            Console.WriteLine("         Likely a reset in flight -- re-check in a moment.");
+            return 0;
+        }
+        Console.WriteLine("Verdict: clean (no boost java, no stale lock/ini, port free).");
+        return 0;
+    }
+
+    // --clean-java: kill stuck boost java + remove stale lock/ini, then report.
+    static int CleanJava(bool verbose)
+    {
+        var report = new List<string>();
+        KillStaleBoostJava(verbose, report);
+        KillBoostPortOwner(verbose, report);   // catches the WMI-invisible boost java holding the port
+        CleanBoostState(verbose, report);
+
+        if (report.Count == 0)
+            Console.WriteLine("Nothing to clean (no stale boost java / lock / ini).");
+        else
+            Console.WriteLine("Cleaned: " + string.Join("; ", report));
+
+        // The port can take a moment to free after the server dies; re-check.
+        if (IsBoostPortListening())
+            Console.WriteLine($"WARNING: boost port {BoostPort} still listening after cleanup -- a server may be re-spawning. "
+                + "If a reset still hangs, unplug/replug the PKOB4 USB cable.");
+        return 0;
     }
 
     readonly record struct BoostResult(bool Ok, int ExitCode, bool TimedOut, string Output);
