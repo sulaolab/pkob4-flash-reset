@@ -469,6 +469,7 @@ internal static class Program
 
         try
         {
+            DisableStandardHandleInheritance();
             using var p = Process.Start(psi);
             if (p == null) return;
             try { p.StandardInput.Close(); } catch { }
@@ -619,6 +620,26 @@ internal static class Program
     [DllImport("iphlpapi.dll", SetLastError = true)]
     static extern uint GetExtendedTcpTable(IntPtr pTcpTable, ref int pdwSize, bool sort,
                                            int ipVersion, int tableClass, int reserved);
+
+    const int STD_OUTPUT_HANDLE = -11;
+    const int STD_ERROR_HANDLE = -12;
+    const uint HANDLE_FLAG_INHERIT = 0x00000001;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern IntPtr GetStdHandle(int nStdHandle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool SetHandleInformation(IntPtr hObject, uint dwMask, uint dwFlags);
+
+    static void DisableStandardHandleInheritance()
+    {
+        foreach (int stdHandle in new[] { STD_OUTPUT_HANDLE, STD_ERROR_HANDLE })
+        {
+            IntPtr handle = GetStdHandle(stdHandle);
+            if (handle == IntPtr.Zero || handle == new IntPtr(-1)) continue;
+            SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+        }
+    }
 
     // PID that OWNS the boost listening port (IPv4), or null. This is the authoritative
     // "who is the boost server" signal -- far more reliable than matching a java process
@@ -811,6 +832,7 @@ internal static class Program
         p.OutputDataReceived += (_, e) => { if (e.Data != null) { lock (sb) sb.AppendLine(e.Data); if (verbose) Console.WriteLine("    " + e.Data); } };
         p.ErrorDataReceived  += (_, e) => { if (e.Data != null) { lock (sb) sb.AppendLine(e.Data); } };
 
+        DisableStandardHandleInheritance();
         p.Start();
         p.BeginOutputReadLine();
         p.BeginErrorReadLine();
@@ -818,6 +840,7 @@ internal static class Program
 
         bool timedOut = false;
         bool earlyFailed = false;
+        bool successSeen = false;
         var sw = Stopwatch.StartNew();
         while (!p.WaitForExit(100))
         {
@@ -828,6 +851,12 @@ internal static class Program
                 earlyFailed = true;
                 if (verbose) Console.WriteLine("    early failure marker: " + marker);
                 try { p.Kill(entireProcessTree: true); } catch { }
+                break;
+            }
+
+            if (LooksSuccess(partial))
+            {
+                successSeen = true;
                 break;
             }
 
@@ -845,8 +874,16 @@ internal static class Program
         }
         else
         {
-            p.WaitForExit(); // let async output handlers drain
+            // Do not call the parameterless WaitForExit() here. IPECMDBoost can
+            // leave the warm server alive with stdout/stderr pipe handles inherited;
+            // sometimes the launcher process is also the warm server. Once Boost
+            // has printed "Operation Succeeded", return without waiting for EOF or
+            // process exit; the server is intentionally kept alive for next time.
+            if (!successSeen)
+                try { p.WaitForExit(1000); } catch { }
         }
+        try { p.CancelOutputRead(); } catch { }
+        try { p.CancelErrorRead(); } catch { }
 
         string outText;
         lock (sb) outText = sb.ToString();
@@ -858,9 +895,22 @@ internal static class Program
 
         // Boost may leave a lingering JVM and exit non-zero even on success, so accept
         // either a clean exit code or the explicit success marker in the output.
-        bool ok = p.ExitCode == 0
-               || outText.Contains("Operation Succeeded", StringComparison.OrdinalIgnoreCase);
-        return new BoostResult(ok, p.ExitCode, false, false, outText);
+        bool hasExited = false;
+        int exitCode = 0;
+        try
+        {
+            hasExited = p.HasExited;
+            if (hasExited) exitCode = p.ExitCode;
+        }
+        catch { }
+
+        bool ok = successSeen || LooksSuccess(outText) || (hasExited && exitCode == 0);
+        return new BoostResult(ok, hasExited ? exitCode : 0, false, false, outText);
+    }
+
+    static bool LooksSuccess(string output)
+    {
+        return output.IndexOf("Operation Succeeded", StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
     static bool LooksEarlyFailure(string output, out string marker)
