@@ -10,7 +10,8 @@
 // checking. It does not touch the PKOB4 USB protocol directly.
 //
 // Exit codes: 0 success, 1 invalid args, 2 MPLAB X/mdb/hex not found,
-//             3 programming failed, 4 timeout after retry, 5 unexpected exception.
+//             3 programming failed, 4 timeout after retry, 5 unexpected exception,
+//             6 reset-after-flash failed.
 
 using System.Diagnostics;
 using System.Text;
@@ -43,6 +44,8 @@ internal static class Program
         bool verbose = false;
         bool dryRun = false;
         bool list = false;
+        bool resetAfterFlash = false;
+        string? resetDevice = null;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -53,6 +56,8 @@ internal static class Program
                 case "--serial": serial = NextArg(args, ref i); break;
                 case "--hex": hex = NextArg(args, ref i); break;
                 case "--device": device = NextArg(args, ref i); break;
+                case "--reset-after-flash": resetAfterFlash = true; break;
+                case "--reset-device": resetDevice = NextArg(args, ref i); break;
                 case "--timeout":
                     if (!int.TryParse(NextArg(args, ref i), out timeoutSec) || timeoutSec <= 0)
                     {
@@ -106,6 +111,7 @@ internal static class Program
         }
 
         string scriptPath = Path.Combine(Path.GetTempPath(), $"flash_pkob4_{Environment.ProcessId}_{Guid.NewGuid():N}.txt");
+        string resolvedResetDevice = resetDevice ?? ToBoostDeviceToken(device);
         string[] scriptLines =
         {
             "device " + device,
@@ -122,6 +128,11 @@ internal static class Program
             Console.WriteLine("Device:  " + device);
             Console.WriteLine("HEX:     " + hexPath);
             Console.WriteLine($"Timeout: {timeoutSec}s   Retry: {retry}");
+            Console.WriteLine($"Reset after flash: {(resetAfterFlash ? "yes" : "no")}");
+            if (resetAfterFlash)
+            {
+                Console.WriteLine("Reset device token: " + resolvedResetDevice);
+            }
             Console.WriteLine("MDB script:");
             foreach (string line in scriptLines)
             {
@@ -132,6 +143,11 @@ internal static class Program
         if (dryRun)
         {
             Console.WriteLine("Dry-run: not programming target.");
+            if (resetAfterFlash)
+            {
+                Console.WriteLine("Dry-run reset command:");
+                Console.WriteLine("  " + DescribeResetCommand(serial, resolvedResetDevice, verbose));
+            }
             return 0;
         }
 
@@ -158,6 +174,17 @@ internal static class Program
                         : "PKOB4 flash succeeded.");
                     Console.WriteLine("Serial: " + serial);
                     Console.WriteLine("HEX: " + hexPath);
+                    if (resetAfterFlash)
+                    {
+                        Console.WriteLine("Running reset after successful flash...");
+                        int resetExit = RunResetAfterFlash(serial, resolvedResetDevice, verbose);
+                        if (resetExit != 0)
+                        {
+                            Console.WriteLine("Flash succeeded, but reset-after-flash failed.");
+                            Console.WriteLine("Reset exit code: " + resetExit);
+                            return 6;
+                        }
+                    }
                     return 0;
                 }
 
@@ -193,7 +220,7 @@ internal static class Program
     private static int Invalid(string message)
     {
         Console.Error.WriteLine("Invalid arguments: " + message);
-        Console.Error.WriteLine("Try: flash_pkob4 --serial <SERIAL> --hex <HEX> [--device D] [--timeout S] [--retry N] [--verbose] [--dry-run]");
+        Console.Error.WriteLine("Try: flash_pkob4 --serial <SERIAL> --hex <HEX> [--device D] [--reset-after-flash] [--verbose] [--dry-run]");
         return 1;
     }
 
@@ -207,6 +234,10 @@ internal static class Program
         Console.WriteLine("  --serial  <sn>    PKOB4 serial number (required), e.g. 020085204RYN000318");
         Console.WriteLine("  --hex     <path>  HEX file to program (required)");
         Console.WriteLine("  --device  <dev>   MDB device token (default dsPIC33AK512MPS512)");
+        Console.WriteLine("  --reset-after-flash");
+        Console.WriteLine("                   after a successful flash, run reset_pkob4 for the same serial");
+        Console.WriteLine("  --reset-device <dev>");
+        Console.WriteLine("                   reset_pkob4 boost token (default derived from --device)");
         Console.WriteLine("  --timeout <sec>   per-attempt timeout (default 120)");
         Console.WriteLine("  --retry   <n>     retries after the first attempt (default 0)");
         Console.WriteLine("  --verbose         print detected paths, script, output and exit code");
@@ -329,6 +360,147 @@ internal static class Program
         {
             // Best effort cleanup only.
         }
+    }
+
+    private static string ToBoostDeviceToken(string mdbDevice)
+    {
+        foreach (string prefix in new[] { "dsPIC", "PIC" })
+        {
+            if (mdbDevice.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                return mdbDevice.Substring(prefix.Length);
+            }
+        }
+        return mdbDevice;
+    }
+
+    private static string DescribeResetCommand(string serial, string device, bool verbose)
+    {
+        if (TryFindResetExe(out string resetExe))
+        {
+            return $"{Quote(resetExe)} --serial {serial} --device {device}{(verbose ? " --verbose" : "")}";
+        }
+
+        if (TryFindResetProject(out string resetProject))
+        {
+            return $"dotnet run --project {Quote(resetProject)} -c Release -- --serial {serial} --device {device}{(verbose ? " --verbose" : "")}";
+        }
+
+        return $"reset_pkob4 --serial {serial} --device {device}{(verbose ? " --verbose" : "")}";
+    }
+
+    private static int RunResetAfterFlash(string serial, string device, bool verbose)
+    {
+        string fileName;
+        string arguments;
+
+        if (TryFindResetExe(out string resetExe))
+        {
+            fileName = resetExe;
+            arguments = $"--serial {serial} --device {device}" + (verbose ? " --verbose" : "");
+        }
+        else if (TryFindResetProject(out string resetProject))
+        {
+            fileName = "dotnet";
+            arguments = $"run --project {Quote(resetProject)} -c Release -- --serial {serial} --device {device}" + (verbose ? " --verbose" : "");
+        }
+        else
+        {
+            Console.Error.WriteLine("reset_pkob4 not found next to flash_pkob4 and reset_pkob4.csproj was not found.");
+            Console.Error.WriteLine("Run reset_pkob4 manually, or publish/copy both tools into the same folder.");
+            return 2;
+        }
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = fileName,
+            Arguments = arguments,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            RedirectStandardInput = true,
+        };
+
+        using var process = new Process { StartInfo = psi };
+        process.OutputDataReceived += (_, e) =>
+        {
+            if (e.Data != null) Console.WriteLine("    reset> " + e.Data);
+        };
+        process.ErrorDataReceived += (_, e) =>
+        {
+            if (e.Data != null) Console.Error.WriteLine("    reset> " + e.Data);
+        };
+
+        process.Start();
+        process.BeginOutputReadLine();
+        process.BeginErrorReadLine();
+        try
+        {
+            process.StandardInput.Close();
+        }
+        catch
+        {
+            // Child receives stdin EOF.
+        }
+
+        if (!process.WaitForExit(150000))
+        {
+            try
+            {
+                process.Kill(entireProcessTree: true);
+            }
+            catch
+            {
+                // Already gone.
+            }
+            return 4;
+        }
+
+        try
+        {
+            process.WaitForExit(1000);
+        }
+        catch
+        {
+            // Best effort output drain.
+        }
+
+        return process.ExitCode;
+    }
+
+    private static bool TryFindResetExe(out string resetExe)
+    {
+        string baseDir = AppContext.BaseDirectory;
+        foreach (string name in new[] { "reset_pkob4.exe", "reset_pkob4" })
+        {
+            string candidate = Path.Combine(baseDir, name);
+            if (File.Exists(candidate))
+            {
+                resetExe = candidate;
+                return true;
+            }
+        }
+
+        resetExe = "";
+        return false;
+    }
+
+    private static bool TryFindResetProject(out string resetProject)
+    {
+        DirectoryInfo? dir = new DirectoryInfo(Environment.CurrentDirectory);
+        for (int depth = 0; dir != null && depth < 8; depth++, dir = dir.Parent)
+        {
+            string candidate = Path.Combine(dir.FullName, "reset_pkob4", "reset_pkob4.csproj");
+            if (File.Exists(candidate))
+            {
+                resetProject = candidate;
+                return true;
+            }
+        }
+
+        resetProject = "";
+        return false;
     }
 
     private readonly record struct MdbResult(bool Ok, int ExitCode, bool TimedOut, string Output);
