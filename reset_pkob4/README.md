@@ -36,7 +36,7 @@ reset_pkob4 --check-java | --clean-java
                    token + Device Id (RESETS each board; confirms the --device token)
   --serial  <sn>   PKOB4 serial number (required for reset), e.g. 020085204RYN000318
   --device  <dev>  device token            (default 33AK512MPS512; SHORT form, no 'dsPIC' prefix)
-  --timeout <sec>  per-attempt timeout      (default 15; --list --probe default 60)
+  --timeout <sec>  per-attempt timeout      (default 60; a cold boost connect can exceed 15s)
   --retry   <n>    retries after attempt 1  (default 1)
   --verbose        print detected paths, the command and the exit code
   --dry-run        print what would run, do nothing
