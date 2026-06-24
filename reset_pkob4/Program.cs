@@ -12,9 +12,9 @@
 // (stdin is closed = the script's "< NUL", which avoids a boost stdin wait.)
 //
 // Exit codes: 0 success, 1 invalid args, 2 MPLAB X/Java/Boost not found,
-//             3 boost reset failed, 4 timeout after retry, 5 unexpected exception,
+//             3 boost reset failed, 4 timeout after recovery, 5 unexpected exception,
 //             6 PKOB4 wedged (USB unplug/replug required -- not retryable),
-//             8 --check-java only: a stuck boost state was detected.
+//             8 --check-java only: a stale/problem boost state was detected.
 
 using System.Diagnostics;
 using System.Management;
@@ -26,6 +26,8 @@ internal static class Program
 {
     const int BoostPort = 2012;          // matches pkob4_reset_auto.ps1
     const string ToolType = "PKOB4";
+    const int DefaultWarmTimeoutSec = 5;
+    const int DefaultColdTimeoutSec = 60;
 
     static int Main(string[] args)
     {
@@ -45,13 +47,9 @@ internal static class Program
         // ---- arguments ----
         string? serial = null;
         string device = "33AK512MPS512";
-        // Default 60s: a healthy boost returns in ~2-3s and we exit as soon as it
-        // does, so a high cap is essentially free -- but a COLD boost (first run, or
-        // right after --clean-java killed the server, or a just-re-enumerated PKOB4)
-        // routinely takes well over 15s to connect. 15s killed those mid-connect and
-        // the reset failed; 60s lets the cold connect actually finish. Pass --timeout
-        // to override (e.g. a smaller value if you want a fast fail).
-        int timeoutSec = 60;
+        int warmTimeoutSec = DefaultWarmTimeoutSec;
+        int coldTimeoutSec = DefaultColdTimeoutSec;
+        int? fixedTimeoutSec = null;
         int retry = 1;
         bool verbose = false;
         bool dryRun = false;
@@ -59,6 +57,7 @@ internal static class Program
         bool probe = false;
         bool cleanJava = false;
         bool checkJava = false;
+        bool shutdownBoost = false;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -68,12 +67,20 @@ internal static class Program
                 case "--list":    list = true; break;
                 case "--probe":   probe = true; break;
                 case "--clean-java": cleanJava = true; break;
+                case "--shutdown-boost": shutdownBoost = true; break;
                 case "--check-java":
                 case "--doctor":  checkJava = true; break;
                 case "--serial":  serial = NextArg(args, ref i); break;
                 case "--device":  device = NextArg(args, ref i); break;
                 case "--timeout":
-                    if (!int.TryParse(NextArg(args, ref i), out timeoutSec) || timeoutSec <= 0) return Invalid("--timeout must be a positive integer (seconds)");
+                    if (!int.TryParse(NextArg(args, ref i), out int timeoutSec) || timeoutSec <= 0) return Invalid("--timeout must be a positive integer (seconds)");
+                    fixedTimeoutSec = timeoutSec;
+                    break;
+                case "--warm-timeout":
+                    if (!int.TryParse(NextArg(args, ref i), out warmTimeoutSec) || warmTimeoutSec <= 0) return Invalid("--warm-timeout must be a positive integer (seconds)");
+                    break;
+                case "--cold-timeout":
+                    if (!int.TryParse(NextArg(args, ref i), out coldTimeoutSec) || coldTimeoutSec <= 0) return Invalid("--cold-timeout must be a positive integer (seconds)");
                     break;
                 case "--retry":   if (!int.TryParse(NextArg(args, ref i), out retry) || retry < 0) return Invalid("--retry must be >= 0"); break;
                 case "--verbose": verbose = true; break;
@@ -84,10 +91,11 @@ internal static class Program
         }
 
         // Java maintenance modes (no target contact, no --serial needed). These are
-        // opt-in escape hatches for when a stale IPECMDBoost server (port 2012) wedges
-        // the workflow -- not for routine use (every reset already self-cleans).
+        // opt-in escape hatches for when an IPECMDBoost server (port 2012) wedges
+        // the workflow -- normal successful resets intentionally keep boost warm.
         if (checkJava) return CheckJava(verbose);
         if (cleanJava) return CleanJava(verbose);
+        if (shutdownBoost) return ShutdownBoostOnly(verbose);
 
         // Guard a very common mistake: boost/ipecmd want the SHORT device token
         // (e.g. 33AK512MPS512). The MPLAB IDE / MDB form 'dsPIC33AK512MPS512' gets
@@ -104,7 +112,7 @@ internal static class Program
         // --list enumerates connected PKOB4 serials and exits (no serial needed).
         // With --probe it also connects to each board to report its device token.
         if (list)
-            return ListPkob4(probe, device, timeoutSec, verbose);
+            return ListPkob4(probe, device, fixedTimeoutSec ?? coldTimeoutSec, verbose);
 
         if (string.IsNullOrWhiteSpace(serial))
             return Invalid("--serial <PKOB4 serial> is required");
@@ -127,7 +135,7 @@ internal static class Program
             Console.WriteLine("Java:    " + javaExe);
             Console.WriteLine("Boost:   " + boostJar);
             Console.WriteLine($"Command: \"{javaExe}\" {boostArgs}");
-            Console.WriteLine($"Serial:  {serial}   Device: {device}   Timeout: {timeoutSec}s   Retry: {retry}");
+            Console.WriteLine($"Serial:  {serial}   Device: {device}   WarmTimeout: {fixedTimeoutSec ?? warmTimeoutSec}s   ColdTimeout: {fixedTimeoutSec ?? coldTimeoutSec}s   RecoveryRetry: {retry}");
         }
 
         if (dryRun)
@@ -136,28 +144,25 @@ internal static class Program
             return 0;
         }
 
-        // ---- run with retry ----
-        int attempts = retry + 1;
+        // ---- run with warm/cold timeout selection ----
         bool lastTimedOut = false;
+        bool lastEarlyFailed = false;
+        bool recovered = false;
+        int attempt = 1;
 
-        for (int attempt = 1; attempt <= attempts; attempt++)
+        while (true)
         {
-            // Safe pre-run cleanup. Kill any stuck boost java FIRST so it releases
-            // its lock/ini file handles, then remove the stale lock/ini. Whatever
-            // was actually cleaned is reported in normal output (not just
-            // --verbose) so the operational state is visible after the fact.
-            var cleanup = new List<string>();
-            KillStaleBoostJava(verbose, cleanup);
-            KillBoostPortOwner(verbose, cleanup);   // catches the WMI-invisible boost java still holding port 2012
-            CleanBoostState(verbose, cleanup);
-            if (cleanup.Count > 0)
-                Console.WriteLine($"Cleanup (attempt {attempt}): " + string.Join("; ", cleanup));
+            bool warm = IsWarmBoostAvailable(out string boostState);
+            int attemptTimeoutSec = fixedTimeoutSec ?? (warm ? warmTimeoutSec : coldTimeoutSec);
+            if (verbose)
+                Console.WriteLine($"Attempt {attempt}: boost={boostState}; timeout={attemptTimeoutSec}s");
 
-            var result = RunBoost(javaExe, boostArgs, timeoutSec, verbose);
+            var result = RunBoost(javaExe, boostArgs, attemptTimeoutSec, verbose);
             lastTimedOut = result.TimedOut;
+            lastEarlyFailed = result.EarlyFailed;
 
             if (verbose)
-                Console.WriteLine($"ExitCode: {result.ExitCode}{(result.TimedOut ? " (timeout)" : "")}");
+                Console.WriteLine($"ExitCode: {result.ExitCode}{(result.TimedOut ? " (timeout)" : "")}{(result.EarlyFailed ? " (early failure)" : "")}");
 
             // Non-retryable: the PKOB4 firmware reported it was unloaded while busy.
             // No amount of host-side cleanup/retry clears this -- the USB device
@@ -174,22 +179,42 @@ internal static class Program
             if (result.Ok)
             {
                 Console.WriteLine(attempt > 1
-                    ? "PKOB4 Boost reset succeeded on retry."
+                    ? "PKOB4 Boost reset succeeded after boost recovery."
                     : "PKOB4 Boost reset succeeded.");
                 Console.WriteLine("Serial: " + serial);
                 return 0;
             }
 
-            if (result.TimedOut && attempt < attempts)
-                Console.WriteLine("PKOB4 Boost reset timed out. Cleaning up Java process and retrying...");
-            else if (!result.TimedOut && attempt < attempts)
-                Console.WriteLine("PKOB4 Boost reset failed. Retrying...");
+            bool shouldRecoverAndRetry = warm && !recovered && retry > 0;
+            bool shouldCleanup = result.TimedOut || result.EarlyFailed || warm;
+            if (shouldCleanup)
+            {
+                var cleanup = new List<string>();
+                Console.WriteLine(result.TimedOut
+                    ? "PKOB4 Boost reset timed out. Recovering boost state..."
+                    : result.EarlyFailed
+                        ? "PKOB4 Boost reset reported an early failure. Recovering boost state..."
+                        : "PKOB4 Boost reset failed. Recovering boost state...");
+                RecoverBoostState(javaExe, boostJar, verbose, cleanup);
+                if (cleanup.Count > 0)
+                    Console.WriteLine("Cleanup: " + string.Join("; ", cleanup));
+            }
+
+            if (shouldRecoverAndRetry)
+            {
+                recovered = true;
+                attempt++;
+                Console.WriteLine($"Retrying once with cold boost timeout ({fixedTimeoutSec ?? coldTimeoutSec}s)...");
+                continue;
+            }
+
+            break;
         }
 
         // ---- give up ----
         Console.WriteLine("PKOB4 Boost reset failed.");
         Console.WriteLine("Serial: " + serial);
-        Console.WriteLine("Reason: " + (lastTimedOut ? "timeout after retry" : "boost reported failure"));
+        Console.WriteLine("Reason: " + (lastTimedOut ? "timeout" : lastEarlyFailed ? "early boost failure" : "boost reported failure"));
         Console.WriteLine("Fallback: press the physical reset button.");
         return lastTimedOut ? 4 : 3;
     }
@@ -222,7 +247,7 @@ internal static class Program
     static int Invalid(string msg)
     {
         Console.Error.WriteLine("Invalid arguments: " + msg);
-        Console.Error.WriteLine("Try: reset_pkob4 --serial <SERIAL> [--device D] [--timeout S] [--retry N] [--verbose] [--dry-run]");
+        Console.Error.WriteLine("Try: reset_pkob4 --serial <SERIAL> [--device D] [--warm-timeout S] [--cold-timeout S] [--verbose] [--dry-run]");
         return 1;
     }
 
@@ -232,18 +257,20 @@ internal static class Program
         Console.WriteLine();
         Console.WriteLine("Usage: reset_pkob4 --serial <SERIAL> [options]");
         Console.WriteLine("       reset_pkob4 --list [--probe] [--device <dev>]");
-        Console.WriteLine("       reset_pkob4 --check-java | --clean-java");
-        Console.WriteLine("  --check-java     fast, side-effect-free check for a stuck IPECMDBoost server");
-        Console.WriteLine("                   (boost java age, port " + BoostPort + ", stale lock/ini); exit 8 = stuck");
-        Console.WriteLine("  --clean-java     kill a stuck boost java + remove stale lock/ini, then exit");
-        Console.WriteLine("                   (opt-in escape hatch; a normal reset already self-cleans)");
+        Console.WriteLine("       reset_pkob4 --check-java | --shutdown-boost | --clean-java");
+        Console.WriteLine("  --check-java     side-effect-free boost warm/cold/stale state check");
+        Console.WriteLine("                   (exit 0 = usable warm/cold state, 8 = stale/problem state)");
+        Console.WriteLine("  --shutdown-boost ask IPECMDBoost to quit via /OQ /OY" + BoostPort + ", then exit");
+        Console.WriteLine("  --clean-java     emergency cleanup: shutdown/kill boost java + remove lock/ini");
         Console.WriteLine("  --list           list connected PKOB4 serial numbers and exit");
         Console.WriteLine("  --probe          with --list: also connect to each board and report its");
         Console.WriteLine("                   device token + Device Id (RESETS each board; needs --device)");
         Console.WriteLine("  --serial  <sn>   PKOB4 serial number (required), e.g. 020085204RYN000318");
         Console.WriteLine("  --device  <dev>  device token (default 33AK512MPS512)");
-        Console.WriteLine("  --timeout <sec>  per-attempt timeout (default 60; cold boost connect can exceed 15s)");
-        Console.WriteLine("  --retry   <n>    retries after the first attempt (default 1)");
+        Console.WriteLine($"  --warm-timeout <s> timeout when boost server is warm (default {DefaultWarmTimeoutSec})");
+        Console.WriteLine($"  --cold-timeout <s> timeout when boost starts cold (default {DefaultColdTimeoutSec})");
+        Console.WriteLine("  --timeout <sec>  legacy override: use one timeout for both warm and cold");
+        Console.WriteLine("  --retry   <n>    recovery retries after a warm failure (default 1)");
         Console.WriteLine("  --verbose        print detected paths, command and exit code");
         Console.WriteLine("  --dry-run        print what would run, do nothing");
     }
@@ -373,7 +400,98 @@ internal static class Program
         return false;
     }
 
-    // Remove the stale boost server lock/ini for our port (the exit-7 fix).
+    static bool IsWarmBoostAvailable(out string state)
+    {
+        int? ownerPid = GetBoostPortOwnerPid();
+        if (ownerPid == null)
+        {
+            state = "cold (port free)";
+            return false;
+        }
+
+        try
+        {
+            using var p = Process.GetProcessById(ownerPid.Value);
+            if (p.ProcessName.Equals("java", StringComparison.OrdinalIgnoreCase))
+            {
+                state = $"warm (port {BoostPort} owned by java PID={ownerPid})";
+                return true;
+            }
+
+            state = $"occupied by non-java process '{p.ProcessName}' PID={ownerPid}";
+            return false;
+        }
+        catch
+        {
+            state = $"occupied by PID={ownerPid}, but owner is no longer readable";
+            return false;
+        }
+    }
+
+    static int ShutdownBoostOnly(bool verbose)
+    {
+        if (!TryDetectMplab(out _, out string javaExe, out string boostJar, out string detectErr))
+        {
+            Console.Error.WriteLine("MPLAB X / Java / IPECMDBoost not found.");
+            Console.Error.WriteLine("Reason: " + detectErr);
+            return 2;
+        }
+
+        var report = new List<string>();
+        RequestBoostShutdown(javaExe, boostJar, verbose, report);
+        if (report.Count == 0)
+            Console.WriteLine("Boost shutdown requested.");
+        else
+            Console.WriteLine("Boost shutdown: " + string.Join("; ", report));
+        return 0;
+    }
+
+    static void RecoverBoostState(string javaExe, string boostJar, bool verbose, List<string> report)
+    {
+        RequestBoostShutdown(javaExe, boostJar, verbose, report);
+        KillBoostPortOwner(verbose, report);   // catches the WMI-invisible boost java holding port 2012
+        KillStaleBoostJava(verbose, report);
+        CleanBoostState(verbose, report);
+    }
+
+    static void RequestBoostShutdown(string javaExe, string boostJar, bool verbose, List<string> report)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = javaExe,
+            Arguments = $"-jar \"{boostJar}\" /OQ /OY{BoostPort}",
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            RedirectStandardInput = true,
+        };
+
+        try
+        {
+            using var p = Process.Start(psi);
+            if (p == null) return;
+            try { p.StandardInput.Close(); } catch { }
+            if (!p.WaitForExit(10000))
+            {
+                try { p.Kill(entireProcessTree: true); } catch { }
+                report.Add("boost /OQ timed out");
+            }
+            else
+            {
+                report.Add("requested boost /OQ");
+            }
+        }
+        catch (Exception ex)
+        {
+            if (verbose) Console.WriteLine("  (boost /OQ skipped: " + ex.Message + ")");
+        }
+
+        Thread.Sleep(250);
+    }
+
+    // Remove the stale boost server lock/ini for our port. These files are normal
+    // while a warm boost server is alive; delete them only after shutdown/kill.
     // Appends a short action string to 'report' for each file actually removed.
     static void CleanBoostState(bool verbose, List<string> report)
     {
@@ -406,7 +524,8 @@ internal static class Program
         }
     }
 
-    // Kill stuck boost-server java. Primary match: command line references
+    // Kill boost-server java during explicit/emergency cleanup. Primary match:
+    // command line references
     // ipecmdboost.jar. Fallback: a java.exe bundled inside MPLAB X (...\MPLABX\
     // ...\sys\java\...) whose command line we cannot read -- Win32_Process
     // CommandLine is often empty for these without elevation, which is exactly
@@ -565,10 +684,10 @@ internal static class Program
         return File.Exists(Path.Combine(ipeState, $"{BoostPort}.{ext}"));
     }
 
-    // --check-java / --doctor: fast, side-effect-free verdict on whether a stuck boost
-    // server is the problem. A healthy boost run returns in ~2-3s, so a boost java that
-    // has been alive much longer -- or a held port / leftover lock|ini -- is the
-    // signature of a wedged server. Exit 0 = clean, 8 = stuck state detected.
+    // --check-java / --doctor: fast, side-effect-free verdict. A java listener on
+    // the boost port is a useful warm server, not a problem. A leftover lock|ini
+    // with no listener, a non-java port owner, or an old java without a listener is
+    // the suspicious/stale state. Exit 0 = usable warm/cold, 8 = stale/problem.
     const double StuckAgeSec = 15;
 
     static int CheckJava(bool verbose)
@@ -603,18 +722,42 @@ internal static class Program
         Console.WriteLine($"  stale {BoostPort}.ini   : {(ini ? "present" : "no")}");
         Console.WriteLine($"  stale {BoostPort}.lock  : {(lck ? "present" : "no")}");
 
-        bool stuck = ownerPid != null || ini || lck || oldProc;
+        bool ownerIsJava = false;
+        bool ownerIsNonJava = false;
+        if (ownerPid != null)
+        {
+            try
+            {
+                using var op = Process.GetProcessById(ownerPid.Value);
+                ownerIsJava = op.ProcessName.Equals("java", StringComparison.OrdinalIgnoreCase);
+                ownerIsNonJava = !ownerIsJava;
+            }
+            catch
+            {
+                ownerIsNonJava = true;
+            }
+        }
+
+        bool staleFilesWithoutServer = ownerPid == null && (ini || lck);
+        bool staleJavaWithoutServer = ownerPid == null && oldProc;
+        bool stuck = ownerIsNonJava || staleFilesWithoutServer || staleJavaWithoutServer;
         if (stuck)
         {
             var why = new List<string>();
-            if (ownerPid != null) why.Add($"port {BoostPort} held by PID={ownerPid}");
-            if (oldProc) why.Add($"a boost java older than {StuckAgeSec:F0}s");
-            if (ini)     why.Add($"{BoostPort}.ini present");
-            if (lck)     why.Add($"{BoostPort}.lock present");
+            if (ownerIsNonJava) why.Add($"port {BoostPort} held by non-java/unknown PID={ownerPid}");
+            if (staleJavaWithoutServer) why.Add($"a boost java older than {StuckAgeSec:F0}s without a listening server");
+            if (staleFilesWithoutServer && ini) why.Add($"{BoostPort}.ini present without a listening server");
+            if (staleFilesWithoutServer && lck) why.Add($"{BoostPort}.lock present without a listening server");
             Console.WriteLine("Verdict: STUCK boost state detected (" + string.Join(", ", why) + ").");
-            Console.WriteLine("Fix: run 'reset_pkob4 --clean-java' (a normal reset also self-cleans before each attempt).");
+            Console.WriteLine("Fix: run 'reset_pkob4 --clean-java'.");
             Console.WriteLine("If it persists after --clean-java, the PKOB4 itself is wedged: unplug/replug the USB cable.");
             return 8;
+        }
+        if (ownerIsJava)
+        {
+            Console.WriteLine($"Verdict: warm boost server available on port {BoostPort}.");
+            Console.WriteLine("         2012.ini/lock may be present in this state; that is normal.");
+            return 0;
         }
         if (procs.Count > 0)
         {
@@ -622,16 +765,18 @@ internal static class Program
             Console.WriteLine("         Likely a reset in flight -- re-check in a moment.");
             return 0;
         }
-        Console.WriteLine("Verdict: clean (no boost java, no stale lock/ini, port free).");
+        Console.WriteLine("Verdict: cold/clean (no boost java, no lock/ini, port free).");
         return 0;
     }
 
-    // --clean-java: kill stuck boost java + remove stale lock/ini, then report.
+    // --clean-java: shutdown/kill boost java + remove lock/ini, then report.
     static int CleanJava(bool verbose)
     {
         var report = new List<string>();
-        KillStaleBoostJava(verbose, report);
+        if (TryDetectMplab(out _, out string javaExe, out string boostJar, out _))
+            RequestBoostShutdown(javaExe, boostJar, verbose, report);
         KillBoostPortOwner(verbose, report);   // catches the WMI-invisible boost java holding the port
+        KillStaleBoostJava(verbose, report);
         CleanBoostState(verbose, report);
 
         if (report.Count == 0)
@@ -646,7 +791,7 @@ internal static class Program
         return 0;
     }
 
-    readonly record struct BoostResult(bool Ok, int ExitCode, bool TimedOut, string Output);
+    readonly record struct BoostResult(bool Ok, int ExitCode, bool TimedOut, bool EarlyFailed, string Output);
 
     static BoostResult RunBoost(string javaExe, string boostArgs, int timeoutSec, bool verbose)
     {
@@ -672,11 +817,31 @@ internal static class Program
         try { p.StandardInput.Close(); } catch { /* = "< NUL": child gets stdin EOF */ }
 
         bool timedOut = false;
-        if (!p.WaitForExit(timeoutSec * 1000))
+        bool earlyFailed = false;
+        var sw = Stopwatch.StartNew();
+        while (!p.WaitForExit(100))
         {
-            try { p.Kill(entireProcessTree: true); } catch { }
+            string partial;
+            lock (sb) partial = sb.ToString();
+            if (LooksEarlyFailure(partial, out string marker))
+            {
+                earlyFailed = true;
+                if (verbose) Console.WriteLine("    early failure marker: " + marker);
+                try { p.Kill(entireProcessTree: true); } catch { }
+                break;
+            }
+
+            if (sw.ElapsedMilliseconds >= timeoutSec * 1000L)
+            {
+                timedOut = true;
+                try { p.Kill(entireProcessTree: true); } catch { }
+                break;
+            }
+        }
+
+        if (timedOut || earlyFailed)
+        {
             try { p.WaitForExit(3000); } catch { }
-            timedOut = true;
         }
         else
         {
@@ -686,22 +851,44 @@ internal static class Program
         string outText;
         lock (sb) outText = sb.ToString();
 
-        // Make sure no detached boost server (a separate /OY<port> java daemon)
-        // lingers after we return. Such a survivor would (a) hold the boost port
-        // for the next run and (b) keep our redirected stdout pipe open, which can
-        // make the *calling* shell appear to hang long after the reset finished.
-        // Killing it here is the difference between "the tool always returns" and
-        // "Java occasionally wedges the workflow".
-        KillStaleBoostJava(false, new List<string>());
-
         if (timedOut)
-            return new BoostResult(false, -1, true, outText);
+            return new BoostResult(false, -1, true, false, outText);
+        if (earlyFailed || LooksEarlyFailure(outText, out _))
+            return new BoostResult(false, -1, false, true, outText);
 
         // Boost may leave a lingering JVM and exit non-zero even on success, so accept
         // either a clean exit code or the explicit success marker in the output.
         bool ok = p.ExitCode == 0
                || outText.Contains("Operation Succeeded", StringComparison.OrdinalIgnoreCase);
-        return new BoostResult(ok, p.ExitCode, false, outText);
+        return new BoostResult(ok, p.ExitCode, false, false, outText);
+    }
+
+    static bool LooksEarlyFailure(string output, out string marker)
+    {
+        foreach (string pattern in new[]
+        {
+            "Operation Failed",
+            "Target device was not found",
+            "Connection Failed",
+            "Could not connect",
+            "No tool found",
+            "Tool is busy",
+            "Unable to connect",
+            "Invalid device",
+            "Wait for current operation to complete",
+            "Failed to reserve tool",
+            "programmer not found",
+        })
+        {
+            if (output.IndexOf(pattern, StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                marker = pattern;
+                return true;
+            }
+        }
+
+        marker = "";
+        return false;
     }
 
     // True if boost output indicates the PKOB4 was unloaded/wedged mid-operation,
