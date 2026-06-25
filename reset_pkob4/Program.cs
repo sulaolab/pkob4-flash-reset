@@ -26,6 +26,7 @@ internal static class Program
 {
     const int BoostPort = 2012;          // matches pkob4_reset_auto.ps1
     const string ToolType = "PKOB4";
+    const string JavaEncodingArgs = "-Dfile.encoding=UTF-8";
     const int DefaultWarmTimeoutSec = 5;
     const int DefaultColdTimeoutSec = 60;
 
@@ -127,7 +128,7 @@ internal static class Program
 
         // Known-working boost args + /TS<serial> for tool selection.
         string boostArgs =
-            $"-jar \"{boostJar}\" /P{device} /TP{ToolType} /TS{serial} /OK /OL /OY{BoostPort}";
+            $"{JavaEncodingArgs} -jar \"{boostJar}\" /P{device} /TP{ToolType} /TS{serial} /OK /OL /OY{BoostPort}";
 
         if (verbose || dryRun)
         {
@@ -459,12 +460,14 @@ internal static class Program
         var psi = new ProcessStartInfo
         {
             FileName = javaExe,
-            Arguments = $"-jar \"{boostJar}\" /OQ /OY{BoostPort}",
+            Arguments = $"{JavaEncodingArgs} -jar \"{boostJar}\" /OQ /OY{BoostPort}",
             UseShellExecute = false,
             CreateNoWindow = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             RedirectStandardInput = true,
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8,
         };
 
         try
@@ -825,6 +828,8 @@ internal static class Program
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             RedirectStandardInput = true,
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8,
         };
 
         var sb = new StringBuilder();
