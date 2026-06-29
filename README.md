@@ -5,6 +5,36 @@ Three small native Windows CLI tools to **flash**, **reset**, and read the
 through its on-board **PKOB4** debugger, selecting the target by **PKOB4 serial
 number**.
 
+## Easiest Integration Path
+
+If you found this repository and simply want a ready-to-use firmware project
+workflow, start from the `dspic33ak-hal-starter` example instead of wiring these
+executables by hand:
+
+- `dspic33ak-hal-starter/buildtools/flashauto.ps1` is a higher-level wrapper that
+  auto-detects the built HEX, chooses the PKOB4 by serial, runs flash, then runs
+  reset.
+- `dspic33ak-hal-starter/buildtools/_flash_reset_tools/` vendors published copies
+  of these executables, so a fresh clone can flash/reset without a separate tool
+  install.
+
+Example:
+
+```powershell
+git clone https://github.com/sulaolab/dspic33ak-hal-starter.git
+cd dspic33ak-hal-starter
+.\buildtools\build.ps1
+.\buildtools\flashauto.ps1
+```
+
+See the starter project wrapper and vendored-tool README:
+
+- https://github.com/sulaolab/dspic33ak-hal-starter/tree/main/buildtools
+- https://github.com/sulaolab/dspic33ak-hal-starter/tree/main/buildtools/_flash_reset_tools
+
+Use this repository directly when you want the standalone low-level tools,
+custom integration, or to rebuild/update the vendored executables.
+
 ## Why this exists
 
 Iterating on firmware from an editor/terminal — not the MPLAB X IDE — runs into
