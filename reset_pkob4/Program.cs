@@ -20,7 +20,10 @@ using System.Diagnostics;
 using System.Management;
 using System.Net.NetworkInformation;
 using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
 using System.Text;
+
+[assembly: SupportedOSPlatform("windows")]
 
 internal static class Program
 {
@@ -154,6 +157,17 @@ internal static class Program
         while (true)
         {
             bool warm = IsWarmBoostAvailable(out string boostState);
+            if (!warm && HasBoostStateFiles(out string staleState))
+            {
+                var preflightCleanup = new List<string>();
+                if (verbose)
+                    Console.WriteLine($"Preflight: boost={boostState}, but stale {staleState} exists; cleaning before cold start.");
+                CleanBoostState(verbose, preflightCleanup);
+                if (preflightCleanup.Count > 0)
+                    Console.WriteLine("Preflight cleanup: " + string.Join("; ", preflightCleanup));
+                warm = IsWarmBoostAvailable(out boostState);
+            }
+
             int attemptTimeoutSec = fixedTimeoutSec ?? (warm ? warmTimeoutSec : coldTimeoutSec);
             if (verbose)
                 Console.WriteLine($"Attempt {attempt}: boost={boostState}; timeout={attemptTimeoutSec}s");
@@ -186,8 +200,9 @@ internal static class Program
                 return 0;
             }
 
-            bool shouldRecoverAndRetry = warm && !recovered && retry > 0;
-            bool shouldCleanup = result.TimedOut || result.EarlyFailed || warm;
+            bool failedWithExitCode = result.ExitCode != 0;
+            bool shouldRecoverAndRetry = !recovered && retry > 0 && (warm || result.TimedOut || result.EarlyFailed || failedWithExitCode);
+            bool shouldCleanup = result.TimedOut || result.EarlyFailed || failedWithExitCode || warm;
             if (shouldCleanup)
             {
                 var cleanup = new List<string>();
@@ -708,6 +723,15 @@ internal static class Program
         return File.Exists(Path.Combine(ipeState, $"{BoostPort}.{ext}"));
     }
 
+    static bool HasBoostStateFiles(out string state)
+    {
+        var parts = new List<string>();
+        if (BoostStateFileExists("lock")) parts.Add($"{BoostPort}.lock");
+        if (BoostStateFileExists("ini")) parts.Add($"{BoostPort}.ini");
+        state = string.Join("/", parts);
+        return parts.Count > 0;
+    }
+
     // --check-java / --doctor: fast, side-effect-free verdict. A java listener on
     // the boost port is a useful warm server, not a problem. A leftover lock|ini
     // with no listener, a non-java port owner, or an old java without a listener is
@@ -931,6 +955,7 @@ internal static class Program
             "Unable to connect",
             "Invalid device",
             "Wait for current operation to complete",
+            "Failed to communicate with IPE server",
             "Failed to reserve tool",
             "programmer not found",
         })

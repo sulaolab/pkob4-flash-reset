@@ -84,12 +84,15 @@ Observed defaults on the current setup:
 - cold boost reset after official shutdown: about 34 s total, so the default cold
   timeout is 60 s.
 
-Cleanup is failure-only. If a warm run times out, or Boost prints a decisive failure
-marker such as `Operation Failed`, `Unable to connect`, `Tool is busy` or `No tool
-found`, the tool requests official shutdown (`/OQ /OY2012`), kills only the java
-process that owns boost port 2012 if it is still alive, removes `2012.lock`/`2012.ini`,
-then retries once as a cold run. Cold failures are cleaned up but are not repeatedly
-retried by default.
+Cleanup is conservative and targeted. Before a cold start, if port 2012 is free
+but stale `2012.lock`/`2012.ini` files are present, the tool removes those files
+first. If a run times out, or Boost prints a decisive failure marker such as
+`Operation Failed`, `Unable to connect`, `Tool is busy`, `No tool found`,
+`Wait for current operation to complete`, or `Failed to communicate with IPE
+server`, or Boost simply exits non-zero, the tool requests official shutdown
+(`/OQ /OY2012`), kills only the java process that owns boost port 2012 if it is
+still alive, removes
+`2012.lock`/`2012.ini`, then retries once as a cold run.
 
 For `--list --probe`, the default per-board timeout is 60 seconds instead of 15.
 Probe performs a real target connection and may include Java / IPECMDBoost /

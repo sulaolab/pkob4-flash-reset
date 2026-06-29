@@ -148,8 +148,9 @@ is not a secret — it is printed on the debugger.
 - A reset re-enumerates the PKOB4 USB, so a serial/CDC console (e.g. Tera Term)
   briefly drops and must reconnect after each reset — expected, not a fault.
 - `reset_pkob4` keeps a healthy `IPECMDBoost` server alive for fast warm resets.
-  It only performs cleanup after timeout or a decisive early failure, using official
-  `/OQ`, then targeted port-owner Java kill and `2012.lock|ini` removal if needed.
+  It removes stale `2012.lock|ini` before cold starts when port 2012 is free, and
+  performs targeted recovery after timeout or a decisive early failure using
+  official `/OQ`, port-owner Java kill and `2012.lock|ini` removal if needed.
 - State escape hatches (no target contact): `reset_pkob4 --check-java` gives a
   fast verdict (warm/cold/stale), `reset_pkob4 --shutdown-boost` asks Boost to quit,
   and `reset_pkob4 --clean-java` performs emergency targeted cleanup.
