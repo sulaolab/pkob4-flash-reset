@@ -5,6 +5,14 @@ Three small native Windows CLI tools to **flash**, **reset**, and read the
 through its on-board **PKOB4** debugger, selecting the target by **PKOB4 serial
 number**.
 
+> [!TIP]
+> Want the quickest ready-to-use setup? See the `dspic33ak-hal-starter`
+> PowerShell wrapper:
+> [`buildtools/flashauto.ps1`](https://github.com/sulaolab/dspic33ak-hal-starter/blob/main/buildtools/flashauto.ps1).
+> It vendors these executables under
+> [`buildtools/_flash_reset_tools`](https://github.com/sulaolab/dspic33ak-hal-starter/tree/main/buildtools/_flash_reset_tools)
+> and provides a practical build → flash → reset workflow.
+
 ## Easiest Integration Path
 
 If you found this repository and simply want a ready-to-use firmware project
