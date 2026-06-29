@@ -7,11 +7,9 @@ number**.
 
 > [!TIP]
 > Want the quickest ready-to-use setup? See the `dspic33ak-hal-starter`
-> PowerShell wrapper:
-> [`buildtools/flashauto.ps1`](https://github.com/sulaolab/dspic33ak-hal-starter/blob/main/buildtools/flashauto.ps1).
-> It vendors these executables under
-> [`buildtools/_flash_reset_tools`](https://github.com/sulaolab/dspic33ak-hal-starter/tree/main/buildtools/_flash_reset_tools)
-> and provides a practical build → flash → reset workflow.
+> [`buildtools/`](https://github.com/sulaolab/dspic33ak-hal-starter/tree/main/buildtools)
+> directory. It includes the PowerShell wrapper, vendors these executables, and
+> provides a practical build → flash → reset workflow.
 
 ## Easiest Integration Path
 
@@ -35,10 +33,9 @@ cd dspic33ak-hal-starter
 .\buildtools\flashauto.ps1
 ```
 
-See the starter project wrapper and vendored-tool README:
+See the starter project's `buildtools/` directory:
 
 - https://github.com/sulaolab/dspic33ak-hal-starter/tree/main/buildtools
-- https://github.com/sulaolab/dspic33ak-hal-starter/tree/main/buildtools/_flash_reset_tools
 
 Use this repository directly when you want the standalone low-level tools,
 custom integration, or to rebuild/update the vendored executables.
